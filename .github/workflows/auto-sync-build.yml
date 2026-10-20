@@ -1,0 +1,68 @@
+name: Auto-sync and build
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        id: sync
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/k1tbyte/Wand-Enhancer.git
+          git fetch upstream
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --ff-only upstream/master
+            git push origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v5
+        if: steps.sync.outputs.changed == 'true'
+        with:
+          version: 10.17.0
+
+      - uses: actions/setup-node@v5
+        if: steps.sync.outputs.changed == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-panel/pnpm-lock.yaml
+
+      - name: Build unsigned executable
+        if: steps.sync.outputs.changed == 'true'
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release
+
+      - name: Read version
+        if: steps.sync.outputs.changed == 'true'
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path WandEnhancer/Properties/AssemblyInfo.cs -Pattern 'AssemblyFileVersion\("([\d\.]+)"\)').Matches[0].Groups[1].Value
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        if: steps.sync.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-${{ steps.ver.outputs.version }}-${{ github.run_number }}
+          name: WandEnhancer ${{ steps.ver.outputs.version }} (auto-build)
+          files: WandEnhancer/bin/Release/WandEnhancer.exe
+          body: Build automatico sincronizado desde upstream k1tbyte/Wand-Enhancer.
