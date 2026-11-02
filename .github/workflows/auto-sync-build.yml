@@ -1,68 +1,102 @@
 name: Auto-sync and build
 
+# Compila directo desde k1tbyte/Wand-Enhancer (no sincroniza este fork)
+# y publica un release solo cuando upstream tiene una versión estable nueva.
+
 on:
   schedule:
     - cron: '17 9 * * *'
   workflow_dispatch: {}
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/auto-sync-build.yml
 
 permissions:
   contents: write
 
-jobs:
-  sync-and-build:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout fork
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+concurrency:
+  group: auto-sync-build
+  cancel-in-progress: false
 
-      - name: Sync with upstream
-        id: sync
-        shell: bash
+env:
+  UPSTREAM_REPO: k1tbyte/Wand-Enhancer
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      is_new: ${{ steps.check.outputs.is_new }}
+    steps:
+      - name: Compare upstream latest release with ours
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git remote add upstream https://github.com/k1tbyte/Wand-Enhancer.git
-          git fetch upstream
-          UPSTREAM_SHA=$(git rev-parse upstream/master)
-          LOCAL_SHA=$(git rev-parse HEAD)
-          if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          # releases/latest ignora prereleases (RC)
+          VERSION=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          if [ -z "$VERSION" ]; then
+            echo "No se pudo leer el último release de upstream" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "v$VERSION ya está publicado; nada que hacer."
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
           else
-            git merge --ff-only upstream/master
-            git push origin HEAD:master
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Versión nueva en upstream: $VERSION"
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
           fi
 
+  build-release:
+    needs: check
+    if: needs.check.outputs.is_new == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Checkout upstream at release tag
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.version }}
+          path: upstream
+
       - uses: pnpm/action-setup@v5
-        if: steps.sync.outputs.changed == 'true'
         with:
           version: 10.17.0
 
       - uses: actions/setup-node@v5
-        if: steps.sync.outputs.changed == 'true'
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: web-panel/pnpm-lock.yaml
+          cache-dependency-path: upstream/web-panel/pnpm-lock.yaml
 
       - name: Build unsigned executable
-        if: steps.sync.outputs.changed == 'true'
         shell: pwsh
+        working-directory: upstream
         run: ./build.ps1 -Configuration Release
 
-      - name: Read version
-        if: steps.sync.outputs.changed == 'true'
-        id: ver
+      - name: Prepare release notes
         shell: pwsh
+        working-directory: upstream
         run: |
-          $v = (Select-String -Path WandEnhancer/Properties/AssemblyInfo.cs -Pattern 'AssemblyFileVersion\("([\d\.]+)"\)').Matches[0].Groups[1].Value
-          echo "version=$v" >> $env:GITHUB_OUTPUT
+          $header = "Build sin firmar compilado desde $env:UPSTREAM_REPO@$env:VERSION.`n`n"
+          try {
+            ./scripts/get-changelog-section.ps1 -Version $env:VERSION -OutputPath notes.md
+            $header + (Get-Content notes.md -Raw) | Set-Content -Path ../release-notes.md -Encoding utf8
+          } catch {
+            $header | Set-Content -Path ../release-notes.md -Encoding utf8
+          }
 
       - name: Publish release
-        if: steps.sync.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: auto-${{ steps.ver.outputs.version }}-${{ github.run_number }}
-          name: WandEnhancer ${{ steps.ver.outputs.version }} (auto-build)
-          files: WandEnhancer/bin/Release/WandEnhancer.exe
-          body: Build automatico sincronizado desde upstream k1tbyte/Wand-Enhancer.
+          tag_name: v${{ env.VERSION }}
+          name: WandEnhancer ${{ env.VERSION }}
+          body_path: release-notes.md
+          files: upstream/WandEnhancer/bin/Release/WandEnhancer.exe
+          fail_on_unmatched_files: true
+          make_latest: true
